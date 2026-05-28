@@ -325,22 +325,51 @@ module_2_ssl() {
 
   # 安装依赖
   log_step "[1/11] 安装依赖..."
-  install_pkgs curl wget socat
+  install_pkgs curl wget socat openssl ca-certificates
+  # 按系统分别启动对应 cron 服务，避免混用报错（Debian 只有 cron，CentOS 只有 crond）
   case "$PKG_MGR" in
-    apt-get) install_pkgs cron ;;
-    dnf|yum) install_pkgs cronie; systemctl enable crond --now ;;
+    apt-get)
+      install_pkgs cron
+      systemctl enable cron &>/dev/null && systemctl start cron &>/dev/null || true
+      ;;
+    dnf|yum)
+      install_pkgs cronie
+      systemctl enable crond &>/dev/null && systemctl start crond &>/dev/null || true
+      ;;
   esac
+
+  # 收集邮箱（用于 acme.sh 注册 Let's Encrypt 账号，不能使用 example.com）
+  local acme_email=""
+  while true; do
+    read -rp $'\e[1m注册邮箱\e[0m（用于证书到期提醒，不能使用 example.com）: ' acme_email
+    if [[ "$acme_email" =~ ^[^@]+@[^@]+\.[^@]+$ ]] && \
+       [[ ! "$acme_email" =~ @example\.com$ ]]; then
+      break
+    fi
+    log_warn "邮箱格式不正确或使用了禁止域名，请重新输入"
+  done
 
   # 安装/更新 acme.sh
   log_step "[2/11] 安装/更新 acme.sh..."
   if [[ -f ~/.acme.sh/acme.sh ]]; then
-    ~/.acme.sh/acme.sh --upgrade --auto-upgrade
+    ~/.acme.sh/acme.sh --upgrade --auto-upgrade &>/dev/null || true
     log_info "acme.sh 已更新"
   else
-    curl -fsSL https://get.acme.sh | sh -s email=admin@example.com
+    if curl -fsSL https://get.acme.sh | sh -s email="$acme_email"; then
+      log_ok "acme.sh 安装完成"
+    else
+      log_warn "主要安装方法失败，尝试备用方法..."
+      wget -O- https://get.acme.sh | sh -s email="$acme_email" || {
+        log_error "acme.sh 安装失败"
+        exit 1
+      }
+    fi
     source ~/.bashrc 2>/dev/null || true
-    log_ok "acme.sh 安装完成"
   fi
+
+  # 注册账号（已安装但未注册，或邮箱需要更新时使用）
+  log_info "注册/更新 Let's Encrypt 账号（邮箱: $acme_email）..."
+  ~/.acme.sh/acme.sh --register-account -m "$acme_email" &>/dev/null || true
   ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
 
   # 收集域名
@@ -353,7 +382,8 @@ module_2_ssl() {
   ask_choice "证书存放路径" 1 M2_CERT_PATH \
     "/etc/ssl/private/" "/etc/nginx/ssl/" "/etc/apache2/ssl/" "/usr/local/ssl/" "自定义"
   [[ "$M2_CERT_PATH" == "自定义" ]] && ask "输入自定义路径" "/etc/ssl/private/" M2_CERT_PATH
-  mkdir -p "$M2_CERT_PATH"; chmod 700 "$M2_CERT_PATH"
+  M2_CERT_PATH="${M2_CERT_PATH%/}/"
+  mkdir -p "$M2_CERT_PATH"; chmod 755 "$M2_CERT_PATH"
 
   # Web 服务
   ask_choice "当前 Web 服务（80端口）" 1 M2_WEBSERVER \
@@ -362,7 +392,9 @@ module_2_ssl() {
   # DNS 检测
   log_step "[4/11] 检测 DNS 解析..."
   for domain in "${DOMAIN_ARR[@]}"; do
-    local resolved; resolved=$(dig +short "$domain" 2>/dev/null | head -1) || resolved=""
+    local resolved=""
+    resolved=$(dig +short "$domain" 2>/dev/null | head -1) || \
+    resolved=$(nslookup "$domain" 2>/dev/null | awk '/^Address: /{print $2}' | head -1) || true
     if [[ -n "$resolved" ]]; then
       log_ok "$domain → $resolved"
     else
@@ -370,17 +402,26 @@ module_2_ssl() {
     fi
   done
 
-  # 停止 Web 服务
+  # 停止 Web 服务（首次申请需占用 80 端口）
   log_step "[5/11] 处理 80 端口..."
   if [[ "$M2_WEBSERVER" != "无（端口空闲）" ]]; then
-    systemctl stop "$M2_WEBSERVER" 2>/dev/null && log_ok "已停止 $M2_WEBSERVER"
+    systemctl stop "$M2_WEBSERVER" 2>/dev/null && log_ok "已停止 $M2_WEBSERVER" || \
+      log_warn "停止 $M2_WEBSERVER 失败，将继续尝试"
   fi
 
-  # 申请证书
+  # 申请证书（去掉 --force，避免消耗 Let's Encrypt 每周颁发限额）
   log_step "[6/11] 申请证书（standalone 模式）..."
   local domain_args=""
   for d in "${DOMAIN_ARR[@]}"; do domain_args="$domain_args -d $d"; done
-  ~/.acme.sh/acme.sh --issue --standalone $domain_args --force
+  if ! ~/.acme.sh/acme.sh --issue --standalone $domain_args; then
+    log_error "证书申请失败，请检查："
+    log_error "  • 域名是否正确解析到本服务器"
+    log_error "  • 防火墙是否开放 80 端口"
+    # 失败后恢复 Web 服务
+    [[ "$M2_WEBSERVER" != "无（端口空闲）" ]] && \
+      systemctl start "$M2_WEBSERVER" 2>/dev/null || true
+    exit 1
+  fi
 
   # 安装证书
   log_step "[7/11] 安装证书到 $M2_CERT_PATH..."
@@ -388,36 +429,64 @@ module_2_ssl() {
   ~/.acme.sh/acme.sh --install-cert -d "$main_domain" \
     --key-file       "${M2_CERT_PATH}private.key" \
     --fullchain-file "${M2_CERT_PATH}fullchain.cer" \
-    --ca-file        "${M2_CERT_PATH}ca.cer"
+    --ca-file        "${M2_CERT_PATH}ca.cer" \
+    --reloadcmd      "echo 'cert installed'"
+  # 设置安全权限
+  chmod 600 "${M2_CERT_PATH}private.key"
+  chmod 644 "${M2_CERT_PATH}fullchain.cer" "${M2_CERT_PATH}ca.cer"
   log_ok "证书文件已安装"
 
-  # Pre/Post Hook
+  # Pre/Post Hook：写入 acme.sh 域名配置文件，解决续期时 80 端口冲突
+  # 续期时 acme.sh 自动执行: PreHook(停服) → standalone续期 → PostHook(启服)
   log_step "[8/11] 配置续期 Hook..."
   if [[ "$M2_WEBSERVER" != "无（端口空闲）" ]]; then
-    ~/.acme.sh/acme.sh --install-cert -d "$main_domain" \
-      --pre-hook  "systemctl stop ${M2_WEBSERVER}" \
-      --post-hook "systemctl start ${M2_WEBSERVER}" 2>/dev/null || true
-    log_ok "Pre/Post Hook 配置完成（续期自动停启 $M2_WEBSERVER）"
+    local conf_file="/root/.acme.sh/${main_domain}/${main_domain}.conf"
+    if [[ -f "$conf_file" ]]; then
+      if ! grep -q "Le_PreHook" "$conf_file"; then
+        echo "Le_PreHook='systemctl stop ${M2_WEBSERVER}'" >> "$conf_file"
+        echo "Le_PostHook='systemctl start ${M2_WEBSERVER}'" >> "$conf_file"
+        log_ok "Pre/Post Hook 写入完成（续期自动停启 $M2_WEBSERVER）"
+      else
+        log_info "Hook 已存在，跳过写入"
+      fi
+    else
+      log_warn "未找到配置文件: $conf_file，请手动添加："
+      log_warn "  Le_PreHook='systemctl stop ${M2_WEBSERVER}'"
+      log_warn "  Le_PostHook='systemctl start ${M2_WEBSERVER}'"
+    fi
+  else
+    log_info "无 Web 服务，续期直接使用 standalone 模式，无需 Hook"
   fi
 
-  # Cron
+  # Cron 自动续期（检查是否已存在，避免重复添加）
   log_step "[9/11] 设置 cron 自动续期..."
-  local cron_job="0 2 * * * ~/.acme.sh/acme.sh --renew-all --stopfail >> /var/log/acme-renew.log 2>&1"
-  (crontab -l 2>/dev/null | grep -v acme.sh; echo "$cron_job") | crontab -
-  log_ok "cron 已配置：每天 02:00 续期"
+  local log_file="/var/log/acme-renew.log"
+  local cron_job="0 2 * * * /root/.acme.sh/acme.sh --cron --home /root/.acme.sh >> $log_file 2>&1"
+  if crontab -l 2>/dev/null | grep -q "acme.sh.*--cron"; then
+    log_info "续期 cron 已存在，跳过"
+  else
+    (crontab -l 2>/dev/null; echo "$cron_job") | crontab -
+    log_ok "cron 已配置：每天 02:00 续期，日志写入 $log_file"
+  fi
 
   # 重启 Web 服务
   log_step "[10/11] 重启 Web 服务..."
   if [[ "$M2_WEBSERVER" != "无（端口空闲）" ]]; then
-    systemctl start "$M2_WEBSERVER" && log_ok "$M2_WEBSERVER 已重启"
+    systemctl start "$M2_WEBSERVER" && log_ok "$M2_WEBSERVER 已重启" || \
+      log_warn "$M2_WEBSERVER 启动失败，请手动检查: systemctl status $M2_WEBSERVER"
   fi
 
-  # 展示信息
+  # 展示证书信息（用 --list 替代 --force 测试，无副作用）
   log_step "[11/11] 证书信息..."
   openssl x509 -in "${M2_CERT_PATH}fullchain.cer" -noout -dates 2>/dev/null || true
+  log_info "当前证书列表："
+  ~/.acme.sh/acme.sh --list
 
   log_sep
   log_ok "✅ 模块 2 完成！证书已安装至 $M2_CERT_PATH"
+  log_info "  私钥: ${M2_CERT_PATH}private.key"
+  log_info "  证书: ${M2_CERT_PATH}fullchain.cer"
+  log_info "  续期日志: $log_file"
   log_sep
 }
 
