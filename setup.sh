@@ -338,38 +338,23 @@ module_2_ssl() {
       ;;
   esac
 
-  # 收集邮箱（用于 acme.sh 注册 Let's Encrypt 账号，不能使用 example.com）
-  local acme_email=""
-  while true; do
-    read -rp $'\e[1m注册邮箱\e[0m（用于证书到期提醒，不能使用 example.com）: ' acme_email
-    if [[ "$acme_email" =~ ^[^@]+@[^@]+\.[^@]+$ ]] && \
-       [[ ! "$acme_email" =~ @example\.com$ ]]; then
-      break
-    fi
-    log_warn "邮箱格式不正确或使用了禁止域名，请重新输入"
-  done
-
   # 安装/更新 acme.sh
   log_step "[2/11] 安装/更新 acme.sh..."
   if [[ -f ~/.acme.sh/acme.sh ]]; then
     ~/.acme.sh/acme.sh --upgrade --auto-upgrade &>/dev/null || true
     log_info "acme.sh 已更新"
   else
-    if curl -fsSL https://get.acme.sh | sh -s email="$acme_email"; then
+    if curl https://get.acme.sh | sh; then
       log_ok "acme.sh 安装完成"
     else
       log_warn "主要安装方法失败，尝试备用方法..."
-      wget -O- https://get.acme.sh | sh -s email="$acme_email" || {
+      wget -O- https://get.acme.sh | sh || {
         log_error "acme.sh 安装失败"
         exit 1
       }
     fi
     source ~/.bashrc 2>/dev/null || true
   fi
-
-  # 注册账号（已安装但未注册，或邮箱需要更新时使用）
-  log_info "注册/更新 Let's Encrypt 账号（邮箱: $acme_email）..."
-  ~/.acme.sh/acme.sh --register-account -m "$acme_email" &>/dev/null || true
   ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
 
   # 收集域名
